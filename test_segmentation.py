@@ -125,7 +125,7 @@ def load_model(model_path, device='cuda'):
     return model
 
 
-def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix=""):
+def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix=""):
     """Test the segmentation model on a single image with proper mask generation"""
     # Load and preprocess image
     image = Image.open(image_path).convert("RGB")
@@ -157,36 +157,105 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
     prototype_masks = predictions['prototype_masks'][0]  # Shape: [prototypes, h, w]
 
     # Process predictions to get actual detections
-    # First, reshape predictions for processing
     num_anchors = cls_pred.shape[0]
     num_classes = cls_pred.shape[1]
     num_prototypes = prototype_masks.shape[0]
+    feature_h, feature_w = cls_pred.shape[2:]
 
-    # Reshape for post-processing
-    h, w = prototype_masks.shape[1:3]
+    # Debugging: Print prediction shape info
+    print(f"Feature map size: {feature_h}x{feature_w}")
+    print(f"Num anchors: {num_anchors}, Num classes: {num_classes}")
 
-    # 1. Get max class scores and corresponding class ids for each anchor
-    cls_scores, cls_ids = torch.max(cls_pred.view(num_anchors, num_classes, -1).mean(dim=2), dim=1)
+    # Apply sigmoid to get probability scores
+    cls_pred_sigmoid = torch.sigmoid(cls_pred)
 
-    # 2. Apply score threshold
-    keep = cls_scores > conf_threshold
-    scores = cls_scores[keep]
-    labels = cls_ids[keep]
+    # Get maximum score across all anchors, features, and classes
+    max_score = cls_pred_sigmoid.max().item()
+    print(f"Maximum confidence score: {max_score:.4f}")
 
-    # If no detections, return early
-    if scores.numel() == 0:
+    # FIX: Better detection extraction - don't average across spatial locations
+    # Reshape to [anchors, classes, h*w]
+    cls_scores = cls_pred_sigmoid.reshape(num_anchors, num_classes, -1)
+
+    # Get best score for each anchor and class combination
+    best_scores, best_loc = cls_scores.max(dim=2)  # [anchors, classes]
+
+    # Get corresponding locations
+    best_h = best_loc // feature_w
+    best_w = best_loc % feature_w
+
+    # Prepare lists for detections
+    all_scores = []
+    all_labels = []
+    all_boxes = []
+    all_mask_coeffs = []
+
+    # For each anchor, check if any class exceeds threshold
+    for a in range(num_anchors):
+        for c in range(num_classes):
+            # Skip background class (0)
+            if c == 0:
+                continue
+
+            score = best_scores[a, c].item()
+            if score > conf_threshold:
+                # Get corresponding box
+                h_idx, w_idx = best_h[a, c].item(), best_w[a, c].item()
+                box = box_pred[a, :, h_idx, w_idx]
+
+                # Get mask coefficients
+                mask_coef = mask_coef_pred[a, :, h_idx, w_idx]
+
+                all_scores.append(score)
+                all_labels.append(c)
+                all_boxes.append(box)
+                all_mask_coeffs.append(mask_coef)
+
+    # Convert to tensors
+    if all_scores:
+        scores = torch.tensor(all_scores, device=device)
+        labels = torch.tensor(all_labels, device=device)
+        boxes = torch.stack(all_boxes)
+        mask_coeffs = torch.stack(all_mask_coeffs)
+    else:
         print(f"No detections found above threshold {conf_threshold}")
+
+        # Create output directories
+        output_dir = 'segmentation_results'
+        os.makedirs(output_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        output_path = os.path.join(output_dir, f"{base_name}{suffix}.jpg")
+
+        # Save the original image with a "No detections" overlay
+        plt.figure(figsize=(12, 8))
+        plt.imshow(np.array(image))
+        plt.axis('off')
+        plt.title(
+            f"Segmentation Results{suffix} (Inference time: {inference_time:.3f}s)\nNo detections found above threshold {conf_threshold}")
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+
+        print(f"Image saved to {output_path}")
         return
 
-    # 3. Get corresponding box predictions
-    boxes = box_pred.view(num_anchors, 4, -1).mean(dim=2)[keep]
-
-    # 4. Get corresponding mask coefficients
-    mask_coeffs = mask_coef_pred.view(num_anchors, num_prototypes, -1).mean(dim=2)[keep]
-
     # Scale boxes to original image size
-    boxes[:, 0::2] *= orig_size[0] / new_size[0]  # scale x
-    boxes[:, 1::2] *= orig_size[1] / new_size[1]  # scale y
+    # Box coordinates are in feature map scale, need to scale to input image and then to original
+    scale_x = orig_size[0] / new_size[0]
+    scale_y = orig_size[1] / new_size[1]
+    input_scale_x = new_size[0] / feature_w
+    input_scale_y = new_size[1] / feature_h
+
+    # Adjust box format: [x1, y1, x2, y2] where x1,y1 is top-left and x2,y2 is bottom-right
+    for i in range(len(boxes)):
+        # Extract coordinates
+        x, y, w, h = boxes[i]
+        # Convert to proper box format and scale to original image
+        x1 = (x - w / 2) * input_scale_x * scale_x
+        y1 = (y - h / 2) * input_scale_y * scale_y
+        x2 = (x + w / 2) * input_scale_x * scale_x
+        y2 = (y + h / 2) * input_scale_y * scale_y
+        boxes[i] = torch.tensor([x1, y1, x2, y2], device=device)
 
     # Convert to numpy for visualization
     image_np = np.array(image)
@@ -209,10 +278,13 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
         score = scores[i].cpu().item()
         label = labels[i].cpu().item()
 
-        # Get class name - skip background (0)
-        if label == 0:
-            continue
+        # Ensure box coordinates are within image bounds
+        box[0] = max(0, min(box[0], w_orig - 1))
+        box[1] = max(0, min(box[1], h_orig - 1))
+        box[2] = max(0, min(box[2], w_orig - 1))
+        box[3] = max(0, min(box[3], h_orig - 1))
 
+        # Get class name
         class_name = TARGET_CLASSES[label]
 
         # Get mask by combining prototypes with coefficients
@@ -238,7 +310,7 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
         binary_mask = (instance_mask > 0.5).cpu().numpy().astype(np.uint8)
 
         # Apply color to mask region
-        color = colors[label - 1 % len(colors)]
+        color = colors[(label - 1) % len(colors)]
         for c in range(3):
             overlay[:, :, c] = np.where(binary_mask == 1,
                                         overlay[:, :, c] * (1 - color[3] / 255) + color[c] * (color[3] / 255),
@@ -288,14 +360,23 @@ def main():
     # Set dataset path
     dataset_path = 'dataset_E4888'
 
+    # Make sure output directory exists
+    os.makedirs('segmentation_results', exist_ok=True)
+
     # Get random sample of images once to use for both models
     images_dir = os.path.join(dataset_path, 'images')
     image_files = [f for f in os.listdir(images_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
-    num_samples = 20
+    num_samples = min(20, len(image_files))
+
     if len(image_files) <= num_samples:
         selected_images = image_files
     else:
+        # Use seed for reproducibility
+        np.random.seed(42)
         selected_images = np.random.choice(image_files, num_samples, replace=False)
+
+    # Lower threshold for testing to see if any detections appear
+    conf_threshold = 0.3  # Lowered from 0.5 for testing
 
     # Test pretrained model
     if os.path.exists(pretrained_model_path):
@@ -303,21 +384,25 @@ def main():
         print(f"Loading model from {pretrained_model_path}...")
         pretrained_model = load_model(pretrained_model_path, device)
 
-        print(f"Testing on {dataset_path}...")
+        print(f"Testing on {dataset_path} with confidence threshold {conf_threshold}...")
         for image_file in selected_images:
             image_path = os.path.join(images_dir, image_file)
             print(f"\nTesting pretrained model on {image_file}...")
-            test_on_image(pretrained_model, image_path, device, suffix="_pretrained")
+            test_on_image(pretrained_model, image_path, device, conf_threshold=conf_threshold, suffix="_pretrained")
     else:
         print(f"Warning: Pretrained model file {pretrained_model_path} not found!")
         print("Using a stub model for demonstration...")
         pretrained_model = YOLACTLite(num_classes=3).to(device)
 
-        print(f"Testing on {dataset_path}...")
-        for image_file in selected_images:
+        print(f"Testing on {dataset_path} with confidence threshold {conf_threshold}...")
+        for i, image_file in enumerate(selected_images):
+            # Only process a few images with stub model to save time
+            if i >= 3:
+                break
             image_path = os.path.join(images_dir, image_file)
-            print(f"\nTesting pretrained model on {image_file}...")
-            test_on_image(pretrained_model, image_path, device, suffix="_pretrained")
+            print(f"\nTesting stub pretrained model on {image_file}...")
+            test_on_image(pretrained_model, image_path, device, conf_threshold=conf_threshold,
+                          suffix="_pretrained_stub")
 
     # Test scratch model
     if os.path.exists(scratch_model_path):
@@ -325,21 +410,24 @@ def main():
         print(f"Loading model from {scratch_model_path}...")
         scratch_model = load_model(scratch_model_path, device)
 
-        print(f"Testing on {dataset_path}...")
+        print(f"Testing on {dataset_path} with confidence threshold {conf_threshold}...")
         for image_file in selected_images:
             image_path = os.path.join(images_dir, image_file)
             print(f"\nTesting scratch model on {image_file}...")
-            test_on_image(scratch_model, image_path, device, suffix="_scratch")
+            test_on_image(scratch_model, image_path, device, conf_threshold=conf_threshold, suffix="_scratch")
     else:
         print(f"Warning: Scratch model file {scratch_model_path} not found!")
         print("Using a stub model for demonstration...")
         scratch_model = YOLACTLite(num_classes=3).to(device)
 
-        print(f"Testing on {dataset_path}...")
-        for image_file in selected_images:
+        print(f"Testing on {dataset_path} with confidence threshold {conf_threshold}...")
+        for i, image_file in enumerate(selected_images):
+            # Only process a few images with stub model to save time
+            if i >= 3:
+                break
             image_path = os.path.join(images_dir, image_file)
-            print(f"\nTesting scratch model on {image_file}...")
-            test_on_image(scratch_model, image_path, device, suffix="_scratch")
+            print(f"\nTesting stub scratch model on {image_file}...")
+            test_on_image(scratch_model, image_path, device, conf_threshold=conf_threshold, suffix="_scratch_stub")
 
     # Print comparative results if both models were tested
     if os.path.exists(pretrained_model_path) and os.path.exists(scratch_model_path):
@@ -347,7 +435,7 @@ def main():
         print("Check the segmentation_results directory for side-by-side comparisons of both models.")
     else:
         print("\n=== Demo Results ===")
-        print("Check the segmentation_results directory for demonstration results using stub models.")
+        print("Check the segmentation_results directory for demonstration results.")
 
 
 if __name__ == "__main__":
