@@ -10,6 +10,7 @@ import datetime
 import math
 from tqdm import tqdm
 import torch.nn.functional as F
+from torchvision import transforms as T
 
 # Target classes for E4888
 TARGET_CLASSES = ['diningtable', 'sofa']
