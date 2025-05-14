@@ -65,7 +65,7 @@ def load_model(model_path, device='cuda'):
     return model
 
 
-def test_on_image(model, image_path, device='cuda', conf_threshold=0.5):
+def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix=""):
     """Test the model on a single image"""
     # Load and preprocess image
     image = Image.open(image_path).convert("RGB")
@@ -128,7 +128,8 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5):
     # Save the result
     output_dir = 'detection_results'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, os.path.basename(image_path))
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    output_path = os.path.join(output_dir, f"{base_name}{suffix}.jpg")
     plt.savefig(output_path)
     plt.close()
 
@@ -172,19 +173,54 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Load pretrained model
-    model_path = 'faster_rcnn_pretrained_best.pth'
-    if not os.path.exists(model_path):
-        print(f"Error: Model file {model_path} not found!")
-        return
+    # Define model paths
+    pretrained_model_path = 'faster_rcnn_pretrained_best.pth'
+    scratch_model_path = 'faster_rcnn_scratch_best.pth'
 
-    print(f"Loading model from {model_path}...")
-    model = load_model(model_path, device)
-
-    # Test on dataset
+    # Set dataset path
     dataset_path = 'dataset_E4888'
-    print(f"Testing on {dataset_path}...")
-    test_on_dataset(model, dataset_path, num_samples=5, device=device)
+
+    # Get random sample of images once to use for both models
+    images_dir = os.path.join(dataset_path, 'images')
+    image_files = [f for f in os.listdir(images_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+    num_samples = 5
+    if len(image_files) <= num_samples:
+        selected_images = image_files
+    else:
+        selected_images = np.random.choice(image_files, num_samples, replace=False)
+
+    # Test pretrained model
+    if os.path.exists(pretrained_model_path):
+        print(f"\n=== Testing model trained with pretrained weights ===")
+        print(f"Loading model from {pretrained_model_path}...")
+        pretrained_model = load_model(pretrained_model_path, device)
+
+        print(f"Testing on {dataset_path}...")
+        for image_file in selected_images:
+            image_path = os.path.join(images_dir, image_file)
+            print(f"\nTesting pretrained model on {image_file}...")
+            test_on_image(pretrained_model, image_path, device, suffix="_pretrained")
+    else:
+        print(f"Warning: Pretrained model file {pretrained_model_path} not found!")
+
+    # Test scratch model
+    if os.path.exists(scratch_model_path):
+        print(f"\n=== Testing model trained from scratch ===")
+        print(f"Loading model from {scratch_model_path}...")
+        scratch_model = load_model(scratch_model_path, device)
+
+        print(f"Testing on {dataset_path}...")
+        for image_file in selected_images:
+            image_path = os.path.join(images_dir, image_file)
+            print(f"\nTesting scratch model on {image_file}...")
+            test_on_image(scratch_model, image_path, device, suffix="_scratch")
+    else:
+        print(f"Warning: Scratch model file {scratch_model_path} not found!")
+
+    # Print comparative results if both models were tested
+    if os.path.exists(pretrained_model_path) and os.path.exists(scratch_model_path):
+        print("\n=== Results comparison ===")
+        print("Check the detection_results directory for side-by-side comparisons of both models.")
 
 
 if __name__ == "__main__":
