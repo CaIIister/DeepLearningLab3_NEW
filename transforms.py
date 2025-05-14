@@ -1,8 +1,7 @@
 import random
 import torch
-import torchvision.transforms as T
 import torchvision.transforms.functional as F
-from PIL import Image, ImageEnhance
+from PIL import Image
 import numpy as np
 
 
@@ -16,62 +15,61 @@ class Compose:
         return image, target
 
 
-class Resize:
+class FixedResize:
     def __init__(self, size):
-        """
-        Args:
-            size: tuple of (height, width) or int
-        """
-        if isinstance(size, int):
-            self.size = (size, size)
-        else:
-            self.size = size  # (height, width)
+        """Size is a tuple of (height, width)"""
+        self.size = size
 
     def __call__(self, image, target):
-        # Get original size - check if image is PIL or tensor
-        if hasattr(image, 'size'):  # PIL Image
-            width, height = image.size
-        else:  # Tensor
-            height, width = image.shape[-2:]
+        # Get original dimensions (image should be PIL)
+        orig_width, orig_height = image.size
 
         # New dimensions
-        new_h, new_w = self.size
+        new_height, new_width = self.size
 
         # Resize image
-        if hasattr(image, 'size'):  # PIL Image
-            image = image.resize((new_w, new_h), Image.BILINEAR)
-        else:  # Tensor
-            image = F.resize(image, self.size)
+        image = image.resize((new_width, new_height), Image.BILINEAR)
 
-        # Scale bounding boxes
+        # Scale boxes
         if "boxes" in target and len(target["boxes"]) > 0:
-            boxes = target["boxes"]
-            scale_x = new_w / width
-            scale_y = new_h / height
+            boxes = target["boxes"].clone()
+
+            # Scale factors
+            scale_x = new_width / orig_width
+            scale_y = new_height / orig_height
 
             # Apply scaling
-            scaled_boxes = boxes.clone()
-            scaled_boxes[:, 0] *= scale_x  # x1
-            scaled_boxes[:, 2] *= scale_x  # x2
-            scaled_boxes[:, 1] *= scale_y  # y1
-            scaled_boxes[:, 3] *= scale_y  # y2
+            boxes[:, 0] *= scale_x  # x1
+            boxes[:, 2] *= scale_x  # x2
+            boxes[:, 1] *= scale_y  # y1
+            boxes[:, 3] *= scale_y  # y2
 
-            target["boxes"] = scaled_boxes
+            target["boxes"] = boxes
 
-        # Scale masks if they exist
+        # Scale masks
         if "masks" in target and len(target["masks"]) > 0:
             masks = target["masks"]
-            resized_masks = []
+            new_masks = []
 
             for mask in masks:
+                # Convert to PIL
                 mask_pil = Image.fromarray(mask.numpy().astype(np.uint8) * 255)
-                mask_resized = mask_pil.resize((new_w, new_h), Image.NEAREST)
-                mask_tensor = torch.tensor(np.array(mask_resized) > 127, dtype=torch.uint8)
-                resized_masks.append(mask_tensor)
+                # Resize
+                resized_mask = mask_pil.resize((new_width, new_height), Image.NEAREST)
+                # Convert back to tensor
+                mask_tensor = torch.tensor(np.array(resized_mask) > 0, dtype=torch.uint8)
+                new_masks.append(mask_tensor)
 
-            if resized_masks:
-                target["masks"] = torch.stack(resized_masks)
+            if new_masks:
+                target["masks"] = torch.stack(new_masks)
 
+        return image, target
+
+
+class ToTensor:
+    def __call__(self, image, target):
+        # Convert PIL image to tensor
+        image = F.to_tensor(image)
         return image, target
 
 
@@ -81,14 +79,18 @@ class RandomHorizontalFlip:
 
     def __call__(self, image, target):
         if random.random() < self.prob:
-            # Flip image
-            image = F.hflip(image)
-            w, h = image.size
+            # Flip image (handle both PIL and tensor)
+            if isinstance(image, torch.Tensor):
+                image = image.flip(-1)
+                width = image.shape[-1]
+            else:  # PIL
+                width, _ = image.size
+                image = F.hflip(image)
 
             # Flip boxes
             if "boxes" in target and len(target["boxes"]) > 0:
-                boxes = target["boxes"]
-                boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
+                boxes = target["boxes"].clone()
+                boxes[:, [0, 2]] = width - boxes[:, [2, 0]]
                 target["boxes"] = boxes
 
             # Flip masks
@@ -96,40 +98,8 @@ class RandomHorizontalFlip:
                 masks = target["masks"]
                 flipped_masks = []
                 for mask in masks:
-                    flipped_masks.append(mask.flip(1))  # Flip horizontally
+                    flipped_masks.append(mask.flip(-1))
                 target["masks"] = torch.stack(flipped_masks)
-
-        return image, target
-
-
-class ColorJitter:
-    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1):
-        self.brightness = brightness
-        self.contrast = contrast
-        self.saturation = saturation
-        self.hue = hue
-
-    def __call__(self, image, target):
-        # Apply color jitter to image
-        brightness_factor = random.uniform(1 - self.brightness, 1 + self.brightness)
-        contrast_factor = random.uniform(1 - self.contrast, 1 + self.contrast)
-        saturation_factor = random.uniform(1 - self.saturation, 1 + self.saturation)
-        hue_factor = random.uniform(-self.hue, self.hue)
-
-        image = ImageEnhance.Brightness(image).enhance(brightness_factor)
-        image = ImageEnhance.Contrast(image).enhance(contrast_factor)
-        image = ImageEnhance.Color(image).enhance(saturation_factor)
-
-        # Convert to HSV, adjust hue, convert back to RGB
-        image = F.adjust_hue(image, hue_factor)
-
-        return image, target
-
-
-class ToTensor:
-    def __call__(self, image, target):
-        # Convert image to tensor
-        image = F.to_tensor(image)
 
         return image, target
 
@@ -140,23 +110,21 @@ class Normalize:
         self.std = std
 
     def __call__(self, image, target):
-        # Normalize image
+        # Normalize image (assumes image is already tensor)
         image = F.normalize(image, mean=self.mean, std=self.std)
-
         return image, target
 
 
 def get_transform(train):
     transforms = []
 
-    # Resize to fixed size (600x600)
-    transforms.append(Resize((600, 600)))
-
-    # Add other transforms
+    # Basic transforms for all data
+    transforms.append(FixedResize((512, 512)))
     transforms.append(ToTensor())
+    transforms.append(Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+
+    # Data augmentation for training
     if train:
         transforms.append(RandomHorizontalFlip(0.5))
 
     return Compose(transforms)
-
-
