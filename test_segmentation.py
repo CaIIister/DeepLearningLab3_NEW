@@ -150,218 +150,172 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
         predictions = model(image_tensor)
         inference_time = time.time() - start_time
 
-    # Get predictions
-    cls_pred = predictions['cls_pred'][0]  # Shape: [anchors, classes, h, w]
-    box_pred = predictions['box_pred'][0]  # Shape: [anchors, 4, h, w]
-    mask_coef_pred = predictions['mask_coef_pred'][0]  # Shape: [anchors, prototypes, h, w]
-    prototype_masks = predictions['prototype_masks'][0]  # Shape: [prototypes, h, w]
+    # Convert image to numpy for drawing
+    image_np = np.array(image)
+    result_img = image_np.copy()
 
-    # Process predictions to get actual detections
-    num_anchors = cls_pred.shape[0]
-    num_classes = cls_pred.shape[1]
+    # Get feature dimensions
+    feature_h, feature_w = predictions['cls_pred'][0].shape[2:]
+    print(f"Feature map dimensions: {feature_h}x{feature_w}")
+
+    # Directly use raw predictions for detections - SIMPLIFIED APPROACH
+    # Get classification scores
+    cls_preds = predictions['cls_pred'][0]  # [anchors, classes, h, w]
+    box_preds = predictions['box_pred'][0]  # [anchors, 4, h, w]
+    prototype_masks = predictions['prototype_masks'][0]  # [prototypes, h_mask, w_mask]
+    mask_coeffs = predictions['mask_coef_pred'][0]  # [anchors, prototypes, h, w]
+
+    # Apply sigmoid to class predictions
+    cls_probs = torch.sigmoid(cls_preds)
+
+    # Debug info
+    print(f"Max classification score: {cls_probs.max().item():.4f}")
+
+    # Non-background classes
+    bg_class = 0  # Assuming 0 is background
+    obj_classes = [i for i in range(cls_probs.shape[1]) if i != bg_class]
+
+    # For simplicity, let's just get the top scoring detections
+    num_anchors, num_classes, _, _ = cls_probs.shape
     num_prototypes = prototype_masks.shape[0]
-    feature_h, feature_w = cls_pred.shape[2:]
 
-    # Debugging: Print prediction shape info
-    print(f"Feature map size: {feature_h}x{feature_w}")
-    print(f"Num anchors: {num_anchors}, Num classes: {num_classes}")
+    # Create detections
+    detections = []
 
-    # Apply sigmoid to get probability scores
-    cls_pred_sigmoid = torch.sigmoid(cls_pred)
-
-    # Get maximum score across all anchors, features, and classes
-    max_score = cls_pred_sigmoid.max().item()
-    print(f"Maximum confidence score: {max_score:.4f}")
-
-    # FIX: Better detection extraction - don't average across spatial locations
-    # Reshape to [anchors, classes, h*w]
-    cls_scores = cls_pred_sigmoid.reshape(num_anchors, num_classes, -1)
-
-    # Get best score for each anchor and class combination
-    best_scores, best_loc = cls_scores.max(dim=2)  # [anchors, classes]
-
-    # Get corresponding locations
-    best_h = best_loc // feature_w
-    best_w = best_loc % feature_w
-
-    # Prepare lists for detections
-    all_scores = []
-    all_labels = []
-    all_boxes = []
-    all_mask_coeffs = []
-
-    # For each anchor, check if any class exceeds threshold
+    # For simplicity, extract detections across all spatial locations
     for a in range(num_anchors):
-        for c in range(num_classes):
-            # Skip background class (0)
-            if c == 0:
-                continue
+        for c in obj_classes:
+            for h in range(feature_h):
+                for w in range(feature_w):
+                    score = cls_probs[a, c, h, w].item()
+                    if score > conf_threshold:
+                        # Get box
+                        box = box_preds[a, :, h, w].cpu().numpy()
 
-            score = best_scores[a, c].item()
-            if score > conf_threshold:
-                # Get corresponding box
-                h_idx, w_idx = best_h[a, c].item(), best_w[a, c].item()
-                box = box_pred[a, :, h_idx, w_idx]
+                        # Get mask coefficients
+                        mask_coeff = mask_coeffs[a, :, h, w]
 
-                # Get mask coefficients
-                mask_coef = mask_coef_pred[a, :, h_idx, w_idx]
+                        # Save detection
+                        detections.append({
+                            'score': score,
+                            'label': c,
+                            'box': box,
+                            'h_idx': h,
+                            'w_idx': w,
+                            'mask_coeff': mask_coeff
+                        })
 
-                all_scores.append(score)
-                all_labels.append(c)
-                all_boxes.append(box)
-                all_mask_coeffs.append(mask_coef)
+    print(f"Found {len(detections)} detections above threshold {conf_threshold}")
 
-    # Convert to tensors
-    if all_scores:
-        scores = torch.tensor(all_scores, device=device)
-        labels = torch.tensor(all_labels, device=device)
-        boxes = torch.stack(all_boxes)
-        mask_coeffs = torch.stack(all_mask_coeffs)
-    else:
-        print(f"No detections found above threshold {conf_threshold}")
+    # If no detections, create empty result
+    if len(detections) == 0:
+        # Save the original image
+        plt.figure(figsize=(12, 8))
+        plt.imshow(image_np)
+        plt.axis('off')
+        plt.title(f"No detections found above threshold {conf_threshold}")
 
-        # Create output directories
+        # Save result
         output_dir = 'segmentation_results'
         os.makedirs(output_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(image_path))[0]
         output_path = os.path.join(output_dir, f"{base_name}{suffix}.jpg")
-
-        # Save the original image with a "No detections" overlay
-        plt.figure(figsize=(12, 8))
-        plt.imshow(np.array(image))
-        plt.axis('off')
-        plt.title(
-            f"Segmentation Results{suffix} (Inference time: {inference_time:.3f}s)\nNo detections found above threshold {conf_threshold}")
-        plt.tight_layout()
         plt.savefig(output_path)
         plt.close()
 
-        print(f"Image saved to {output_path}")
+        print(f"No detections found. Image saved to {output_path}")
         return
 
-    # Scale boxes to original image size
-    # Box coordinates are in feature map scale, need to scale to input image and then to original
-    scale_x = orig_size[0] / new_size[0]
-    scale_y = orig_size[1] / new_size[1]
-    input_scale_x = new_size[0] / feature_w
-    input_scale_y = new_size[1] / feature_h
+    # Sort detections by score
+    detections.sort(key=lambda x: x['score'], reverse=True)
 
-    # Adjust box format: [x1, y1, x2, y2] where x1,y1 is top-left and x2,y2 is bottom-right
-    for i in range(len(boxes)):
-        # Extract coordinates
-        x, y, w, h = boxes[i]
-        # Convert to proper box format and scale to original image
-        x1 = (x - w / 2) * input_scale_x * scale_x
-        y1 = (y - h / 2) * input_scale_y * scale_y
-        x2 = (x + w / 2) * input_scale_x * scale_x
-        y2 = (y + h / 2) * input_scale_y * scale_y
-        boxes[i] = torch.tensor([x1, y1, x2, y2], device=device)
-
-    # Convert to numpy for visualization
-    image_np = np.array(image)
-    h_orig, w_orig, _ = image_np.shape
-
-    # Create a copy of the image to draw on
-    result_image = image_np.copy()
-
-    # Colors for different classes
+    # Colors for visualization
     colors = [
-        (0, 255, 0),  # diningtable - green
-        (0, 0, 255),  # sofa - blue
-        (255, 0, 0)  # extra color - red
+        (0, 255, 0),  # Green for first class
+        (0, 0, 255),  # Blue for second class
+        (255, 0, 0)  # Red for third class
     ]
 
-    # For each detection, generate mask and visualize
-    for i in range(len(scores)):
-        # Get detection info
-        box = boxes[i].cpu().numpy().astype(np.int32)
-        score = scores[i].cpu().item()
-        label = labels[i].cpu().item()
-
-        # Ensure box coordinates are within image bounds
-        box[0] = max(0, min(box[0], w_orig - 1))
-        box[1] = max(0, min(box[1], h_orig - 1))
-        box[2] = max(0, min(box[2], w_orig - 1))
-        box[3] = max(0, min(box[3], h_orig - 1))
-
-        # Get class name
+    # For each detection, draw bounding box and mask
+    for detection in detections:
+        # Get class and score
+        label = detection['label']
+        score = detection['score']
         class_name = TARGET_CLASSES[label]
+        color = colors[(label - 1) % len(colors)]  # Skip background
 
-        # Get mask by combining prototypes with coefficients
-        mask_coeff = mask_coeffs[i]
+        # Scale box to original image size
+        x, y, w, h = detection['box']
+        input_scale_x = new_size[0] / feature_w
+        input_scale_y = new_size[1] / feature_h
+        scale_x = orig_size[0] / new_size[0]
+        scale_y = orig_size[1] / new_size[1]
+
+        # Convert to [x1, y1, x2, y2] format and scale to original image
+        x1 = int((x - w / 2) * input_scale_x * scale_x)
+        y1 = int((y - h / 2) * input_scale_y * scale_y)
+        x2 = int((x + w / 2) * input_scale_x * scale_x)
+        y2 = int((y + h / 2) * input_scale_y * scale_y)
+
+        # Clip to image boundaries
+        x1 = max(0, min(x1, image_np.shape[1] - 1))
+        y1 = max(0, min(y1, image_np.shape[0] - 1))
+        x2 = max(0, min(x2, image_np.shape[1] - 1))
+        y2 = max(0, min(y2, image_np.shape[0] - 1))
+
+        # Draw bounding box directly on the result image
+        cv2.rectangle(result_img, (x1, y1), (x2, y2), color, 2)
+
+        # Generate mask - use prototype masks and coefficients
+        mask_coeff = detection['mask_coeff']
 
         # Resize prototype masks to original image size
         proto_masks_resized = F.interpolate(
             prototype_masks.unsqueeze(0),
-            size=(h_orig, w_orig),
+            size=(image_np.shape[0], image_np.shape[1]),
             mode='bilinear',
             align_corners=False
         ).squeeze(0)
 
         # Combine prototypes using coefficients
-        instance_mask = torch.zeros((h_orig, w_orig), device=device)
+        mask = torch.zeros((image_np.shape[0], image_np.shape[1]), device=device)
         for j in range(num_prototypes):
-            instance_mask += mask_coeff[j] * proto_masks_resized[j]
+            mask += mask_coeff[j] * proto_masks_resized[j]
 
-        # Apply sigmoid to get probability map
-        instance_mask = torch.sigmoid(instance_mask)
+        # Apply sigmoid and threshold to get binary mask
+        mask = torch.sigmoid(mask) > 0.5
+        mask_np = mask.cpu().numpy().astype(np.uint8)
 
-        # Threshold mask to get binary mask
-        binary_mask = (instance_mask > 0.5).cpu().numpy().astype(np.uint8)
-
-        # Get color for current detection
-        color = colors[(label - 1) % len(colors)]
-
-        # Create a mask overlay
-        mask_color = np.zeros_like(result_image)
+        # Apply a color overlay on the mask region
         for c in range(3):
-            mask_color[:, :, c] = color[c]
-
-        # Add a highlighted mask edge
-        kernel = np.ones((3, 3), np.uint8)
-        mask_edge = cv2.dilate(binary_mask, kernel) - binary_mask
-
-        # Apply color overlay where the mask is active
-        for c in range(3):
-            # Add mask color with alpha blending
-            result_image[:, :, c] = np.where(
-                binary_mask == 1,
-                result_image[:, :, c] * 0.3 + color[c] * 0.7,  # 70% mask color, 30% original
-                result_image[:, :, c]
+            # Apply RGB channels with alpha=0.5
+            result_img[:, :, c] = np.where(
+                mask_np == 1,
+                result_img[:, :, c] * 0.5 + color[c] * 0.5,
+                result_img[:, :, c]
             )
 
-            # Add contrasting border at mask edges
-            result_image[:, :, c] = np.where(
-                mask_edge == 1,
-                255 if color[c] < 128 else 0,  # Contrasting color for border
-                result_image[:, :, c]
-            )
-
-        # Draw bounding box
-        cv2.rectangle(result_image, (box[0], box[1]), (box[2], box[3]), color, 3)
-
-        # Add label with better visibility
+        # Draw label text with background
         label_text = f"{class_name}: {score:.2f}"
-        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_size = cv2.getTextSize(label_text, font, 0.5, 2)[0]
 
-        # Add background for text
-        cv2.rectangle(result_image,
-                      (box[0], box[1] - 25),
-                      (box[0] + text_size[0], box[1]),
-                      color, -1)  # -1 fills the rectangle
+        # Draw filled rectangle for text background
+        cv2.rectangle(result_img,
+                      (x1, y1 - text_size[1] - 5),
+                      (x1 + text_size[0], y1),
+                      color, -1)
 
-        # Add text with white color for contrast
-        cv2.putText(result_image, label_text, (box[0], box[1] - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Draw text
+        cv2.putText(result_img, label_text, (x1, y1 - 5), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Display results
     plt.figure(figsize=(12, 8))
-    plt.imshow(result_image)
+    plt.imshow(result_img)
     plt.axis('off')
     plt.title(f"Segmentation Results{suffix} (Inference time: {inference_time:.3f}s)")
-    plt.tight_layout()
 
-    # Save the result
+    # Save result
     output_dir = 'segmentation_results'
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -369,8 +323,8 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
     plt.savefig(output_path)
     plt.close()
 
-    print(f"Segmentation results saved to {output_path}")
-    print(f"Found {len(scores)} objects with confidence > {conf_threshold}")
+    print(f"Found {len(detections)} objects with confidence > {conf_threshold}")
+    print(f"Image saved to {output_path}")
     print(f"Inference time: {inference_time:.3f} seconds")
 
 
