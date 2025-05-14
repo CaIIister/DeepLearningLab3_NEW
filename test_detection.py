@@ -18,9 +18,9 @@ def create_faster_rcnn_model(num_classes=3, backbone='resnet18'):
     """Create a Faster R-CNN model with the same architecture as during training"""
     # Load backbone
     if backbone == 'resnet18':
-        backbone_model = torchvision.models.resnet18(pretrained=False)
+        backbone_model = torchvision.models.resnet18(weights=None)
     elif backbone == 'resnet34':
-        backbone_model = torchvision.models.resnet34(pretrained=False)
+        backbone_model = torchvision.models.resnet34(weights=None)
     else:
         raise ValueError(f"Unsupported backbone: {backbone}")
 
@@ -122,7 +122,7 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
     plt.figure(figsize=(12, 8))
     plt.imshow(image_np)
     plt.axis('off')
-    plt.title(f"Detection Results (Inference time: {inference_time:.3f}s)")
+    plt.title(f"Detection Results{suffix} (Inference time: {inference_time:.3f}s)")
     plt.tight_layout()
 
     # Save the result
@@ -138,34 +138,6 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
     print(f"Inference time: {inference_time:.3f} seconds")
 
     return boxes, scores, labels
-
-
-def test_on_dataset(model, dataset_path, num_samples=5, device='cuda'):
-    """Test the model on a random sample of images from the dataset"""
-    # Get list of images
-    images_dir = os.path.join(dataset_path, 'images')
-    image_files = [f for f in os.listdir(images_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
-
-    # Select random samples
-    if len(image_files) <= num_samples:
-        samples = image_files
-    else:
-        samples = np.random.choice(image_files, num_samples, replace=False)
-
-    # Test each sample
-    results = []
-    for image_file in samples:
-        image_path = os.path.join(images_dir, image_file)
-        print(f"\nTesting on {image_file}...")
-        boxes, scores, labels = test_on_image(model, image_path, device)
-        results.append({
-            'image': image_file,
-            'boxes': boxes,
-            'scores': scores,
-            'labels': labels
-        })
-
-    return results
 
 
 def main():
