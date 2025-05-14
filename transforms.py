@@ -136,19 +136,57 @@ class Normalize:
 
 
 def get_transform(train):
-    """Get appropriate transforms for train or val"""
     transforms = []
 
-    # Basic resizing
-    transforms.append(Resize(600, 1000))
+    # Add fixed-size resize (e.g., 600x600)
+    transforms.append(Resize((600, 600)))
 
-    if train:
-        # Data augmentation for training
-        transforms.append(RandomHorizontalFlip(0.5))
-        transforms.append(ColorJitter())
-
-    # Convert to tensor and normalize
+    # Add other transforms
     transforms.append(ToTensor())
-    transforms.append(Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+    if train:
+        transforms.append(RandomHorizontalFlip(0.5))
 
     return Compose(transforms)
+
+
+class Resize:
+    def __init__(self, size):
+        self.size = size  # (height, width)
+
+    def __call__(self, image, target):
+        # Get original size
+        width, height = image.size
+
+        # Resize image
+        image = image.resize(self.size[::-1], Image.BILINEAR)  # PIL uses (width, height)
+
+        # Scale bounding boxes
+        if "boxes" in target and len(target["boxes"]) > 0:
+            boxes = target["boxes"]
+            scale_x = self.size[1] / width
+            scale_y = self.size[0] / height
+
+            # Apply scaling
+            scaled_boxes = boxes.clone()
+            scaled_boxes[:, 0] *= scale_x  # x1
+            scaled_boxes[:, 2] *= scale_x  # x2
+            scaled_boxes[:, 1] *= scale_y  # y1
+            scaled_boxes[:, 3] *= scale_y  # y2
+
+            target["boxes"] = scaled_boxes
+
+        # Scale masks if they exist
+        if "masks" in target and len(target["masks"]) > 0:
+            masks = target["masks"]
+            resized_masks = []
+
+            for mask in masks:
+                mask_pil = Image.fromarray(mask.numpy().astype(np.uint8) * 255)
+                mask_resized = mask_pil.resize(self.size[::-1], Image.NEAREST)
+                mask_tensor = torch.tensor(np.array(mask_resized) > 127, dtype=torch.uint8)
+                resized_masks.append(mask_tensor)
+
+            if resized_masks:
+                target["masks"] = torch.stack(resized_masks)
+
+        return image, target
