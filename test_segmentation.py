@@ -232,7 +232,7 @@ def main():
     # Get random sample of images once to use for both models
     images_dir = os.path.join(dataset_path, 'images')
     image_files = [f for f in os.listdir(images_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
-    num_samples = 5
+    num_samples = 20
     if len(image_files) <= num_samples:
         selected_images = image_files
     else:
