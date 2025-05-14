@@ -126,7 +126,7 @@ class CustomTransforms:
 
     def __call__(self, image, target):
         # Convert to tensor
-        image = transforms.ToTensor()(image)
+        image = T.ToTensor()(image)
 
         # Normalize
         image = transforms.Normalize(
@@ -137,7 +137,7 @@ class CustomTransforms:
         if self.train:
             # Random horizontal flip
             if np.random.random() > 0.5:
-                image = transforms.functional.hflip(image)
+                image = T.functional.hflip(image)
 
                 width = image.shape[2]
                 if "boxes" in target and len(target["boxes"]) > 0:
@@ -155,9 +155,15 @@ def create_faster_rcnn_model(num_classes=3, pretrained=False, backbone='resnet18
     """
     # Load a pre-trained model for transfer learning
     if backbone == 'resnet18':
-        backbone_model = torchvision.models.resnet18(pretrained=pretrained)
+        if pretrained:
+            backbone_model = torchvision.models.resnet18(weights='DEFAULT')
+        else:
+            backbone_model = torchvision.models.resnet18(weights=None)
     elif backbone == 'resnet34':
-        backbone_model = torchvision.models.resnet34(pretrained=pretrained)
+        if pretrained:
+            backbone_model = torchvision.models.resnet34(weights='DEFAULT')
+        else:
+            backbone_model = torchvision.models.resnet34(weights=None)
     else:
         raise ValueError(f"Unsupported backbone: {backbone}")
 
