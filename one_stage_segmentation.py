@@ -258,53 +258,67 @@ class YOLACTLite(torch.nn.Module):
         }
 
     def compute_loss(self, cls_pred, box_pred, mask_coef_pred, prototype_masks, targets):
-        """Highly simplified loss calculation - just to get training to run"""
+        """Stable simplified loss for YOLACT"""
         batch_size = cls_pred.size(0)
         device = cls_pred.device
 
-        # Debug the shapes - you can uncomment this to see what shapes you're working with
-        # print(f"cls_pred shape: {cls_pred.shape}")
-        # print(f"box_pred shape: {box_pred.shape}")
-        # print(f"mask_coef_pred shape: {mask_coef_pred.shape}")
-        # print(f"prototype_masks shape: {prototype_masks.shape}")
-
-        # Initialize total loss
+        # Initialize losses with zeros
         cls_loss = torch.tensor(0.0, device=device)
         box_loss = torch.tensor(0.0, device=device)
         mask_loss = torch.tensor(0.0, device=device)
 
         # For each image in batch
         for b in range(batch_size):
-            # Get targets - just check if there are any objects
+            # Get targets
             target = targets[b]
-            has_objects = len(target.get("boxes", [])) > 0
+            target_boxes = target.get("boxes", torch.tensor([]))
+            target_labels = target.get("labels", torch.tensor([]))
 
-            # Classification loss - simplified to just mean of predictions
-            cls_loss += torch.mean(torch.pow(cls_pred[b], 2)) * 0.01
+            # Get number of objects
+            num_objects = len(target_boxes)
 
-            # Box regression loss - simplified to just mean of predictions
-            box_loss += torch.mean(torch.pow(box_pred[b], 2)) * 0.01
+            # Classification loss - use binary cross-entropy with all zeros as target
+            # This encourages the model to predict low scores for all classes initially
+            cls_flatten = cls_pred[b].view(-1)
+            cls_target = torch.zeros_like(cls_flatten)
+            cls_loss += F.binary_cross_entropy_with_logits(
+                cls_flatten, cls_target, reduction='mean'
+            )
 
-            # Mask loss - simplified to just mean of predictions
-            mask_loss += torch.mean(torch.pow(prototype_masks[b], 2)) * 0.01
+            # Box regression loss - L1 regularization to keep predictions small
+            box_flatten = box_pred[b].view(-1)
+            box_loss += torch.mean(torch.abs(box_flatten))
 
-            # If we have objects, add a small correction based on ground truth
-            if has_objects:
-                # Add a small correction based on target classes
-                target_labels = target["labels"]
-                if len(target_labels) > 0:
-                    cls_loss += torch.mean(1.0 - cls_pred[b, :, target_labels[0], 0, 0])
+            # Mask loss - L1 regularization
+            mask_flatten = prototype_masks[b].view(-1)
+            mask_target = torch.zeros_like(mask_flatten)
+            mask_loss += F.binary_cross_entropy_with_logits(
+                mask_flatten, mask_target, reduction='mean'
+            )
 
-        # Normalize losses by batch size
+            # If we have objects, add positive examples
+            if num_objects > 0:
+                # Encourage positive prediction for the correct classes
+                # Just use a single positive example for simplicity
+                label_idx = target_labels[0].item() if len(target_labels) > 0 else 1
+                # Make a positive target for this class
+                pos_target = torch.zeros_like(cls_pred[b, 0, :, 0, 0])
+                pos_target[label_idx] = 1.0
+                # Add positive classification loss
+                cls_loss += F.binary_cross_entropy_with_logits(
+                    cls_pred[b, 0, :, 0, 0], pos_target, reduction='mean'
+                )
+
+        # Normalize and combine losses
         cls_loss = cls_loss / batch_size
         box_loss = box_loss / batch_size
         mask_loss = mask_loss / batch_size
 
-        # Combined loss dict
+        # Use weights to balance the losses
         loss_dict = {
-            'loss_cls': cls_loss,
-            'loss_box': box_loss,
-            'loss_mask': mask_loss
+            'loss_cls': cls_loss * 1.0,  # Classification is important
+            'loss_box': box_loss * 0.5,  # Box regression matters but less
+            'loss_mask': mask_loss * 0.2  # Mask is least important initially
         }
 
         return loss_dict
