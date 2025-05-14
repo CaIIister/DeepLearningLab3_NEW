@@ -236,9 +236,9 @@ class YOLACTComplete(nn.Module):
         device = prototype_masks.device
 
         # Initialize losses
-        cls_loss = torch.tensor(0.0, device=device)
-        box_loss = torch.tensor(0.0, device=device)
-        mask_loss = torch.tensor(0.0, device=device)
+        cls_loss = (predictions['cls'][0].sum() * 0.0)
+        box_loss = (predictions['box'][0].sum() * 0.0)
+        mask_loss = (predictions['mask'][0].sum() * 0.0)
 
         # Process each image in batch
         for b in range(batch_size):

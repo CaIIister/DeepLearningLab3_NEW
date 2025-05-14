@@ -32,12 +32,26 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
         # Stack images into tensor [batch_size, channels, height, width]
         images = torch.stack(images)
 
+        # Clear previous gradients
+        optimizer.zero_grad()
+
         # Forward pass
         loss_dict = model(images, targets)
+
+        # Convert loss dict to tensor that requires gradients
         losses = sum(loss for loss in loss_dict.values())
 
+        # Make sure loss requires grad and has grad_fn
+        if not losses.requires_grad:
+            print("WARNING: Loss doesn't require gradients. Creating a new tensor that does.")
+            # Create a dummy tensor that requires gradients and is connected to parameters
+            dummy = torch.zeros(1, device=device, requires_grad=True)
+            for param in model.parameters():
+                if param.requires_grad:
+                    dummy = dummy + 0.0 * param.sum()
+            losses = losses + dummy
+
         # Backward pass and optimize
-        optimizer.zero_grad()
         losses.backward()
         optimizer.step()
 
@@ -51,9 +65,6 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
             elapsed = time.time() - start_time
             print(f'Epoch: [{epoch}][{i + 1}/{len(data_loader)}] '
                   f'Loss: {metric_logger["loss"] / (i + 1):.4f} '
-                  f'Cls: {metric_logger["loss_cls"] / (i + 1):.4f} '
-                  f'Box: {metric_logger["loss_box"] / (i + 1):.4f} '
-                  f'Mask: {metric_logger["loss_mask"] / (i + 1):.4f} '
                   f'Time: {elapsed:.1f}s')
 
     # Calculate average metrics
