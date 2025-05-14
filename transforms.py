@@ -17,49 +17,60 @@ class Compose:
 
 
 class Resize:
-    def __init__(self, min_size, max_size):
-        self.min_size = min_size
-        self.max_size = max_size
+    def __init__(self, size):
+        """
+        Args:
+            size: tuple of (height, width) or int
+        """
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = size  # (height, width)
 
     def __call__(self, image, target):
-        # Resize image while maintaining aspect ratio
-        w, h = image.size
-
-        # Determine size to resize to
-        min_orig = min(w, h)
-        max_orig = max(w, h)
-
-        # Scale factor to achieve min_size
-        scale_factor = self.min_size / min_orig
-
-        # Check if max dimension will exceed max_size
-        if max_orig * scale_factor > self.max_size:
-            scale_factor = self.max_size / max_orig
+        # Get original size - check if image is PIL or tensor
+        if hasattr(image, 'size'):  # PIL Image
+            width, height = image.size
+        else:  # Tensor
+            height, width = image.shape[-2:]
 
         # New dimensions
-        new_w = int(w * scale_factor)
-        new_h = int(h * scale_factor)
+        new_h, new_w = self.size
 
         # Resize image
-        image = image.resize((new_w, new_h), Image.BILINEAR)
+        if hasattr(image, 'size'):  # PIL Image
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+        else:  # Tensor
+            image = F.resize(image, self.size)
 
-        # Scale targets
+        # Scale bounding boxes
         if "boxes" in target and len(target["boxes"]) > 0:
             boxes = target["boxes"]
-            boxes[:, [0, 2]] *= (new_w / w)
-            boxes[:, [1, 3]] *= (new_h / h)
-            target["boxes"] = boxes
+            scale_x = new_w / width
+            scale_y = new_h / height
 
+            # Apply scaling
+            scaled_boxes = boxes.clone()
+            scaled_boxes[:, 0] *= scale_x  # x1
+            scaled_boxes[:, 2] *= scale_x  # x2
+            scaled_boxes[:, 1] *= scale_y  # y1
+            scaled_boxes[:, 3] *= scale_y  # y2
+
+            target["boxes"] = scaled_boxes
+
+        # Scale masks if they exist
         if "masks" in target and len(target["masks"]) > 0:
             masks = target["masks"]
             resized_masks = []
+
             for mask in masks:
                 mask_pil = Image.fromarray(mask.numpy().astype(np.uint8) * 255)
                 mask_resized = mask_pil.resize((new_w, new_h), Image.NEAREST)
                 mask_tensor = torch.tensor(np.array(mask_resized) > 127, dtype=torch.uint8)
                 resized_masks.append(mask_tensor)
 
-            target["masks"] = torch.stack(resized_masks) if resized_masks else masks
+            if resized_masks:
+                target["masks"] = torch.stack(resized_masks)
 
         return image, target
 
@@ -138,7 +149,7 @@ class Normalize:
 def get_transform(train):
     transforms = []
 
-    # Add fixed-size resize (e.g., 600x600)
+    # Resize to fixed size (600x600)
     transforms.append(Resize((600, 600)))
 
     # Add other transforms
@@ -149,44 +160,3 @@ def get_transform(train):
     return Compose(transforms)
 
 
-class Resize:
-    def __init__(self, size):
-        self.size = size  # (height, width)
-
-    def __call__(self, image, target):
-        # Get original size
-        width, height = image.size
-
-        # Resize image
-        image = image.resize(self.size[::-1], Image.BILINEAR)  # PIL uses (width, height)
-
-        # Scale bounding boxes
-        if "boxes" in target and len(target["boxes"]) > 0:
-            boxes = target["boxes"]
-            scale_x = self.size[1] / width
-            scale_y = self.size[0] / height
-
-            # Apply scaling
-            scaled_boxes = boxes.clone()
-            scaled_boxes[:, 0] *= scale_x  # x1
-            scaled_boxes[:, 2] *= scale_x  # x2
-            scaled_boxes[:, 1] *= scale_y  # y1
-            scaled_boxes[:, 3] *= scale_y  # y2
-
-            target["boxes"] = scaled_boxes
-
-        # Scale masks if they exist
-        if "masks" in target and len(target["masks"]) > 0:
-            masks = target["masks"]
-            resized_masks = []
-
-            for mask in masks:
-                mask_pil = Image.fromarray(mask.numpy().astype(np.uint8) * 255)
-                mask_resized = mask_pil.resize(self.size[::-1], Image.NEAREST)
-                mask_tensor = torch.tensor(np.array(mask_resized) > 127, dtype=torch.uint8)
-                resized_masks.append(mask_tensor)
-
-            if resized_masks:
-                target["masks"] = torch.stack(resized_masks)
-
-        return image, target
