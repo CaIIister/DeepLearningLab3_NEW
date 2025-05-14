@@ -267,6 +267,12 @@ class YOLACTLite(torch.nn.Module):
         box_loss = torch.tensor(0.0, device=device)
         mask_loss = torch.tensor(0.0, device=device)
 
+        # First, let's print the shapes to understand what we're working with
+        # print(f"cls_pred shape: {cls_pred.shape}")
+        # print(f"box_pred shape: {box_pred.shape}")
+        # print(f"mask_coef_pred shape: {mask_coef_pred.shape}")
+        # print(f"prototype_masks shape: {prototype_masks.shape}")
+
         # Process each item in batch
         for b in range(batch_size):
             # Get target boxes and labels for this batch item
@@ -277,70 +283,69 @@ class YOLACTLite(torch.nn.Module):
             if target_boxes is None or len(target_boxes) == 0:
                 continue
 
-            # Reshape predictions for this batch item
-            # cls: [batch, anchors, classes, h, w] -> [anchors*h*w, classes]
-            b_cls_pred = cls_pred[b].permute(0, 3, 4, 1).reshape(-1, self.num_classes)
+            # Get predictions for this batch item
+            # Flatten the predictions for easier processing
+            # cls_pred: [batch_size, num_anchors, num_classes, h, w]
+            b_cls_pred = cls_pred[b].view(self.num_anchors, self.num_classes, -1)
+            b_cls_pred = b_cls_pred.permute(0, 2, 1).reshape(-1, self.num_classes)
 
-            # box: [batch, anchors, 4, h, w] -> [anchors*h*w, 4]
-            b_box_pred = box_pred[b].permute(0, 3, 4, 1).reshape(-1, 4)
+            # box_pred: [batch_size, num_anchors, 4, h, w]
+            b_box_pred = box_pred[b].view(self.num_anchors, 4, -1)
+            b_box_pred = b_box_pred.permute(0, 2, 1).reshape(-1, 4)
 
             # Basic classification loss (binary cross entropy)
-            # Create a simple target - for each GT box, find the closest anchor
             num_anchors = b_cls_pred.size(0)
             gt_cls = torch.zeros((num_anchors, self.num_classes), device=device)
 
-            # For simplicity, assign all anchors with IoU > threshold to target class
+            # For simplicity, assign all predictions to target class
             for box_idx, (box, label) in enumerate(zip(target_boxes, target_labels)):
                 # Create a simplified target - just use the class label
                 if label > 0:  # Skip background class
-                    gt_cls[:, label] = 1.0
+                    # Instead of attempting to match, just assign class to all predictions
+                    gt_cls[:, label] = 0.1  # Small positive value to avoid overconfidence
 
             # Binary Cross Entropy loss for classification
             cls_loss += F.binary_cross_entropy_with_logits(
                 b_cls_pred, gt_cls, reduction='sum'
-            ) / max(1, len(target_boxes))
+            ) / max(1, num_anchors)
 
             # Simple L1 loss for box regression
-            # For simplicity, use the GT boxes as targets for all predictions
-            # In a real implementation, you'd match predictions to targets
-            box_targets = target_boxes.repeat(num_anchors // len(target_boxes) + 1, 1)[:num_anchors]
-            box_loss += F.smooth_l1_loss(
-                b_box_pred, box_targets, reduction='sum'
-            ) / max(1, len(target_boxes))
+            # For simplified training, use the first GT box as target for all predictions
+            if len(target_boxes) > 0:
+                box_target = target_boxes[0].unsqueeze(0).repeat(num_anchors, 1)
+                box_loss += F.smooth_l1_loss(
+                    b_box_pred, box_target, reduction='sum'
+                ) / max(1, num_anchors)
 
-            # Simple mask loss if masks are available
-            if target_masks is not None and len(target_masks) > 0:
-                # For simplicity, use direct binary cross entropy on prototype masks
-                mask_preds = prototype_masks[b]
-                mask_targets = target_masks.float()
+            # Simple mask loss - just use prototype masks directly
+            if prototype_masks.numel() > 0 and target_masks is not None and target_masks.numel() > 0:
+                # Use first mask for simplicity
+                mask_pred = prototype_masks[b]
 
-                # Reshape to match
-                if mask_preds.size(0) != mask_targets.size(0):
-                    mask_preds = mask_preds[:mask_targets.size(0)] if mask_preds.size(0) > mask_targets.size(
-                        0) else mask_preds
-                    mask_targets = mask_targets[:mask_preds.size(0)] if mask_targets.size(0) > mask_preds.size(
-                        0) else mask_targets
+                # Ensure target mask is right size
+                if target_masks.size(0) > 0:
+                    mask_target = F.interpolate(
+                        target_masks[0].unsqueeze(0).float(),
+                        size=mask_pred.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
 
-                # Binary cross entropy for mask prediction
-                mask_loss += F.binary_cross_entropy_with_logits(
-                    mask_preds, mask_targets, reduction='sum'
-                ) / max(1, len(target_masks))
+                    # Binary cross entropy for mask prediction
+                    mask_loss += F.binary_cross_entropy_with_logits(
+                        mask_pred, mask_target, reduction='mean'
+                    )
 
         # Normalize by batch size
         cls_loss = cls_loss / batch_size
         box_loss = box_loss / batch_size
         mask_loss = mask_loss / batch_size
 
-        # Weight the losses
-        cls_weight = 1.0
-        box_weight = 1.0
-        mask_weight = 1.0
-
         # Return loss dictionary
         loss_dict = {
-            'loss_cls': cls_loss * cls_weight,
-            'loss_box': box_loss * box_weight,
-            'loss_mask': mask_loss * mask_weight
+            'loss_cls': cls_loss,
+            'loss_box': box_loss,
+            'loss_mask': mask_loss
         }
 
         return loss_dict
