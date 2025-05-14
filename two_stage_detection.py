@@ -267,8 +267,12 @@ def evaluate_model(model, data_loader, device):
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+            model.train()
             # Calculate loss
             loss_dict = model(images, targets)
+
+            model.eval()
+
             losses = sum(loss for loss in loss_dict.values())
             loss_sum += losses.item()
 
