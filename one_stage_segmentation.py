@@ -41,13 +41,15 @@ class VOCInstanceSegDataset(Dataset):
         anno_path = os.path.join(self.root, 'annotations', f"{img_id}.xml")
         target = self.parse_voc_xml(ET.parse(anno_path).getroot())
 
+        # Get image dimensions
+        width, height = img.size
+
         # Prepare target tensors
         boxes = []
         labels = []
         masks = []  # For instance segmentation
 
         # Create binary masks for each object
-        width, height = img.size
         for obj in target['object']:
             # Get bounding box
             bbox = obj['bndbox']
@@ -64,7 +66,6 @@ class VOCInstanceSegDataset(Dataset):
             labels.append(self.class_to_idx[obj['name']])
 
             # Create a simple rectangular mask for demonstration
-            # In a real implementation, we would use segmentation data from COCO or generate masks
             mask = torch.zeros((height, width), dtype=torch.uint8)
             mask[int(ymin):int(ymax), int(xmin):int(xmax)] = 1
             masks.append(mask)
@@ -285,20 +286,53 @@ class CustomTransforms:
         self.train = train
 
     def __call__(self, image, target):
+        # First resize to ensure consistent dimensions
+        width, height = image.size
+
+        # Fixed size for all images (e.g., 512x512)
+        new_width, new_height = 512, 512
+
+        # Resize image
+        image = image.resize((new_width, new_height), Image.BILINEAR)
+
+        # Need to adjust bounding boxes and masks for the new size
+        if "boxes" in target and len(target["boxes"]) > 0:
+            # Scale factors
+            scale_x = new_width / width
+            scale_y = new_height / height
+
+            # Scale boxes
+            boxes = target["boxes"].clone()
+            boxes[:, [0, 2]] = boxes[:, [0, 2]] * scale_x
+            boxes[:, [1, 3]] = boxes[:, [1, 3]] * scale_y
+            target["boxes"] = boxes
+
+            # Scale masks if they exist
+            if "masks" in target:
+                # Resize masks to new dimensions
+                masks = target["masks"]
+                resized_masks = []
+                for mask in masks:
+                    mask_pil = Image.fromarray(mask.numpy().astype(np.uint8) * 255)
+                    mask_resized = mask_pil.resize((new_width, new_height), Image.NEAREST)
+                    mask_tensor = torch.tensor(np.array(mask_resized) > 127, dtype=torch.uint8)
+                    resized_masks.append(mask_tensor)
+
+                target["masks"] = torch.stack(resized_masks) if resized_masks else masks
+
         # Convert to tensor
-        image = torchvision.transforms.functional.to_tensor(image)
+        image = T.ToTensor()(image)
 
         # Normalize
-        image = torchvision.transforms.functional.normalize(
-            image,
+        image = T.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
-        )
+        )(image)
 
         if self.train:
             # Random horizontal flip - flip both image and masks
             if torch.rand(1).item() > 0.5:
-                image = torchvision.transforms.functional.hflip(image)
+                image = T.functional.hflip(image)
                 if "masks" in target:
                     target["masks"] = torch.flip(target["masks"], [2])
 
