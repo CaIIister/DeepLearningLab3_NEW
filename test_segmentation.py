@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import time
 from torchvision import transforms as T
+import torch.nn.functional as F
 
 # Target classes for E4888
 TARGET_CLASSES = ['background', 'diningtable', 'sofa']
@@ -125,14 +126,23 @@ def load_model(model_path, device='cuda'):
 
 
 def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix=""):
-    """Test the segmentation model on a single image"""
+    """Test the segmentation model on a single image with proper mask generation"""
     # Load and preprocess image
     image = Image.open(image_path).convert("RGB")
+    orig_size = image.size  # (width, height)
+
+    # Resize for model input (maintain aspect ratio)
+    max_size = 640
+    ratio = min(max_size / max(orig_size), 1.0)
+    new_size = (int(orig_size[0] * ratio), int(orig_size[1] * ratio))
+    image_resized = image.resize(new_size, Image.BILINEAR)
+
+    # Convert to tensor and normalize
     transform = T.Compose([
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    image_tensor = transform(image).unsqueeze(0).to(device)
+    image_tensor = transform(image_resized).unsqueeze(0).to(device)
 
     # Run inference
     with torch.no_grad():
@@ -140,53 +150,106 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
         predictions = model(image_tensor)
         inference_time = time.time() - start_time
 
-    # For demonstration, generate random masks
-    image_np = np.array(image)
-    h, w, _ = image_np.shape
+    # Get predictions
+    cls_pred = predictions['cls_pred'][0]  # Shape: [anchors, classes, h, w]
+    box_pred = predictions['box_pred'][0]  # Shape: [anchors, 4, h, w]
+    mask_coef_pred = predictions['mask_coef_pred'][0]  # Shape: [anchors, prototypes, h, w]
+    prototype_masks = predictions['prototype_masks'][0]  # Shape: [prototypes, h, w]
 
-    # Create random detection results for visualization
-    num_detections = np.random.randint(1, 4)
+    # Process predictions to get actual detections
+    # First, reshape predictions for processing
+    num_anchors = cls_pred.shape[0]
+    num_classes = cls_pred.shape[1]
+    num_prototypes = prototype_masks.shape[0]
+
+    # Reshape for post-processing
+    h, w = prototype_masks.shape[1:3]
+
+    # 1. Get max class scores and corresponding class ids for each anchor
+    cls_scores, cls_ids = torch.max(cls_pred.view(num_anchors, num_classes, -1).mean(dim=2), dim=1)
+
+    # 2. Apply score threshold
+    keep = cls_scores > conf_threshold
+    scores = cls_scores[keep]
+    labels = cls_ids[keep]
+
+    # If no detections, return early
+    if scores.numel() == 0:
+        print(f"No detections found above threshold {conf_threshold}")
+        return
+
+    # 3. Get corresponding box predictions
+    boxes = box_pred.view(num_anchors, 4, -1).mean(dim=2)[keep]
+
+    # 4. Get corresponding mask coefficients
+    mask_coeffs = mask_coef_pred.view(num_anchors, num_prototypes, -1).mean(dim=2)[keep]
+
+    # Scale boxes to original image size
+    boxes[:, 0::2] *= orig_size[0] / new_size[0]  # scale x
+    boxes[:, 1::2] *= orig_size[1] / new_size[1]  # scale y
+
+    # Convert to numpy for visualization
+    image_np = np.array(image)
+    h_orig, w_orig, _ = image_np.shape
 
     # Create overlay for visualization
     overlay = image_np.copy()
 
-    # Colors for different classes
-    colors = {
-        1: (0, 255, 0, 128),  # diningtable - green with alpha
-        2: (0, 0, 255, 128)  # sofa - blue with alpha
-    }
+    # Colors for different classes (handle more than 2 classes if needed)
+    colors = [
+        (0, 255, 0, 128),  # diningtable - green with alpha
+        (0, 0, 255, 128),  # sofa - blue with alpha
+        (255, 0, 0, 128)  # extra color
+    ]
 
-    # Create random boxes and masks for visualization
-    for i in range(num_detections):
-        # Random class
-        cls = np.random.choice([1, 2])  # diningtable or sofa
+    # For each detection, generate mask and visualize
+    for i in range(len(scores)):
+        # Get detection info
+        box = boxes[i].cpu().numpy().astype(np.int32)
+        score = scores[i].cpu().item()
+        label = labels[i].cpu().item()
 
-        # Random box
-        x1 = np.random.randint(0, w // 2)
-        y1 = np.random.randint(0, h // 2)
-        x2 = np.random.randint(x1 + w // 4, w)
-        y2 = np.random.randint(y1 + h // 4, h)
+        # Get class name - skip background (0)
+        if label == 0:
+            continue
 
-        # Random confidence score
-        score = np.random.uniform(0.6, 0.95)
+        class_name = TARGET_CLASSES[label]
 
-        # Create mask (simplified as a rectangle for demonstration)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[y1:y2, x1:x2] = 1
+        # Get mask by combining prototypes with coefficients
+        mask_coeff = mask_coeffs[i]
+
+        # Resize prototype masks to original image size
+        proto_masks_resized = F.interpolate(
+            prototype_masks.unsqueeze(0),
+            size=(h_orig, w_orig),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+
+        # Combine prototypes using coefficients
+        instance_mask = torch.zeros((h_orig, w_orig), device=device)
+        for j in range(num_prototypes):
+            instance_mask += mask_coeff[j] * proto_masks_resized[j]
+
+        # Apply sigmoid to get probability map
+        instance_mask = torch.sigmoid(instance_mask)
+
+        # Threshold mask to get binary mask
+        binary_mask = (instance_mask > 0.5).cpu().numpy().astype(np.uint8)
 
         # Apply color to mask region
-        color = colors.get(cls)
+        color = colors[label - 1 % len(colors)]
         for c in range(3):
-            overlay[:, :, c] = np.where(mask == 1,
+            overlay[:, :, c] = np.where(binary_mask == 1,
                                         overlay[:, :, c] * (1 - color[3] / 255) + color[c] * (color[3] / 255),
                                         overlay[:, :, c])
 
         # Draw bounding box
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color[:3], 2)
+        cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), color[:3], 2)
 
         # Add label and score
-        label_text = f"{TARGET_CLASSES[cls]}: {score:.2f}"
-        cv2.putText(overlay, label_text, (x1, y1 - 5),
+        label_text = f"{class_name}: {score:.2f}"
+        cv2.putText(overlay, label_text, (box[0], box[1] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color[:3], 2)
 
     # Blend original and overlay
@@ -209,12 +272,8 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.5, suffix="
     plt.close()
 
     print(f"Segmentation results saved to {output_path}")
-    print(f"Found {num_detections} objects with confidence > {conf_threshold}")
+    print(f"Found {len(scores)} objects with confidence > {conf_threshold}")
     print(f"Inference time: {inference_time:.3f} seconds")
-
-    # This is a simplified inference visualization
-    print("Note: This is a simplified visualization with random segmentation masks.")
-    print("In a real implementation, masks would be generated from model outputs.")
 
 
 def main():
