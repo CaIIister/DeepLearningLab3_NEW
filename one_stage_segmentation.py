@@ -418,9 +418,18 @@ def evaluate_model(model, data_loader, device):
             images = torch.stack(images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Calculate loss
+            # For evaluation, temporarily set to train mode to get losses
+            model.train()
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            model.eval()
+
+            # Calculate loss - handle both dict and direct loss cases
+            if isinstance(loss_dict, dict):
+                losses = sum(loss for loss in loss_dict.values())
+            else:
+                # If loss_dict is actually just a scalar loss
+                losses = loss_dict
+
             loss_sum += losses.item()
 
     avg_loss = loss_sum / len(data_loader)
