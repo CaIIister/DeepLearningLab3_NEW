@@ -300,7 +300,7 @@ class YOLACTComplete(nn.Module):
             neg_cls_loss = neg_cls_loss.sum() / max(1, neg_mask.sum())
 
             # Combined classification loss
-            cls_loss += pos_cls_loss + neg_cls_loss
+            cls_loss = cls_loss + pos_cls_loss + neg_cls_loss
 
             # Box regression loss - Smooth L1
             # Convert anchor format [x1, y1, x2, y2] to [cx, cy, w, h]
@@ -329,7 +329,7 @@ class YOLACTComplete(nn.Module):
             pos_box_pred = box_pred[pos_mask]
 
             # Smooth L1 loss for box regression
-            box_loss += F.smooth_l1_loss(pos_box_pred, target_deltas, reduction='mean')
+            box_loss = box_loss + F.smooth_l1_loss(pos_box_pred, target_deltas, reduction='mean')
 
             # Mask loss
             if target_masks is not None and len(target_masks) > 0:
@@ -338,11 +338,17 @@ class YOLACTComplete(nn.Module):
 
                 # For each positive anchor, combine prototypes using mask coefficients
                 for i in range(len(pos_mask_pred)):
+                    if pos_idx[i] >= len(target_masks):
+                        continue  # Skip if index is out of bounds
+
                     coeff = pos_mask_pred[i]
                     target_mask = target_masks[pos_idx[i]]
 
-                    # Combine prototypes
-                    combined_mask = prototype_masks.permute(1, 2, 0) @ coeff
+                    # FIX: Get the batch item from prototype_masks
+                    # This is the key fix - use prototype_masks[b] instead of prototype_masks
+                    # to get the correct batch item's prototypes
+                    proto = prototype_masks[b]
+                    combined_mask = proto.permute(1, 2, 0) @ coeff
 
                     # Match size of target mask
                     combined_mask = F.interpolate(
@@ -353,7 +359,7 @@ class YOLACTComplete(nn.Module):
                     ).squeeze()
 
                     # Binary cross entropy loss for mask
-                    mask_loss += F.binary_cross_entropy_with_logits(
+                    mask_loss = mask_loss + F.binary_cross_entropy_with_logits(
                         combined_mask, target_mask.float(), reduction='mean'
                     )
 
