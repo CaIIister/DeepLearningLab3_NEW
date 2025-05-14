@@ -261,14 +261,14 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
     image_np = np.array(image)
     h_orig, w_orig, _ = image_np.shape
 
-    # Create overlay for visualization
-    overlay = image_np.copy()
+    # Create a copy of the image to draw on
+    result_image = image_np.copy()
 
-    # IMPROVED: Colors for different classes with higher alpha for better visibility
+    # Colors for different classes
     colors = [
-        (0, 255, 0, 200),  # diningtable - green with higher alpha
-        (0, 0, 255, 200),  # sofa - blue with higher alpha
-        (255, 0, 0, 200)  # extra color with higher alpha
+        (0, 255, 0),  # diningtable - green
+        (0, 0, 255),  # sofa - blue
+        (255, 0, 0)  # extra color - red
     ]
 
     # For each detection, generate mask and visualize
@@ -309,48 +309,54 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
         # Threshold mask to get binary mask
         binary_mask = (instance_mask > 0.5).cpu().numpy().astype(np.uint8)
 
-        # IMPROVED: Add a dilated edge to make mask boundaries more visible
+        # Get color for current detection
+        color = colors[(label - 1) % len(colors)]
+
+        # Create a mask overlay
+        mask_color = np.zeros_like(result_image)
+        for c in range(3):
+            mask_color[:, :, c] = color[c]
+
+        # Add a highlighted mask edge
         kernel = np.ones((3, 3), np.uint8)
         mask_edge = cv2.dilate(binary_mask, kernel) - binary_mask
 
-        # Apply mask color with improved visibility
-        color = colors[(label - 1) % len(colors)]
-        mask_overlay = overlay.copy()
-
-        # Apply color directly for stronger effect
+        # Apply color overlay where the mask is active
         for c in range(3):
-            mask_overlay[:, :, c] = np.where(binary_mask == 1, color[c], mask_overlay[:, :, c])
+            # Add mask color with alpha blending
+            result_image[:, :, c] = np.where(
+                binary_mask == 1,
+                result_image[:, :, c] * 0.3 + color[c] * 0.7,  # 70% mask color, 30% original
+                result_image[:, :, c]
+            )
+
             # Add contrasting border at mask edges
-            overlay[:, :, c] = np.where(mask_edge == 1, 0 if color[c] > 128 else 255, overlay[:, :, c])
+            result_image[:, :, c] = np.where(
+                mask_edge == 1,
+                255 if color[c] < 128 else 0,  # Contrasting color for border
+                result_image[:, :, c]
+            )
 
-        # Apply mask with higher opacity
-        alpha_mask = 0.7  # Increased opacity for masks
-        overlay = cv2.addWeighted(overlay, 1.0 - alpha_mask, mask_overlay, alpha_mask, 0)
+        # Draw bounding box
+        cv2.rectangle(result_image, (box[0], box[1]), (box[2], box[3]), color, 3)
 
-        # IMPROVED: Draw thicker bounding box
-        cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), color[:3], 3)
-
-        # IMPROVED: Add label with better visibility
+        # Add label with better visibility
         label_text = f"{class_name}: {score:.2f}"
         text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
 
         # Add background for text
-        cv2.rectangle(overlay,
+        cv2.rectangle(result_image,
                       (box[0], box[1] - 25),
                       (box[0] + text_size[0], box[1]),
-                      color[:3], -1)  # -1 fills the rectangle
+                      color, -1)  # -1 fills the rectangle
 
         # Add text with white color for contrast
-        cv2.putText(overlay, label_text, (box[0], box[1] - 5),
+        cv2.putText(result_image, label_text, (box[0], box[1] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-    # IMPROVED: Blend with higher alpha for better visibility
-    alpha = 0.8  # Increased from 0.5
-    output = cv2.addWeighted(image_np, 1 - alpha, overlay, alpha, 0)
 
     # Display results
     plt.figure(figsize=(12, 8))
-    plt.imshow(output)
+    plt.imshow(result_image)
     plt.axis('off')
     plt.title(f"Segmentation Results{suffix} (Inference time: {inference_time:.3f}s)")
     plt.tight_layout()
