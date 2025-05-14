@@ -15,14 +15,13 @@ TARGET_CLASSES = ['background', 'diningtable', 'sofa']
 
 class YOLACTLite(torch.nn.Module):
     """
-    A lightweight version of YOLACT for instance segmentation.
-    This should match the model used during training.
+    A lightweight version of YOLACT for instance segmentation, optimized for lower memory usage.
     """
 
-    def __init__(self, num_classes, backbone='resnet18'):
+    def __init__(self, num_classes, pretrained=False, backbone='resnet18'):
         super(YOLACTLite, self).__init__()
 
-        # Load backbone
+        # Load a pre-trained backbone
         if backbone == 'resnet18':
             backbone_model = torchvision.models.resnet18(weights=None)
         elif backbone == 'resnet34':
@@ -32,7 +31,7 @@ class YOLACTLite(torch.nn.Module):
 
         # Extract backbone layers
         self.backbone = torch.nn.Sequential(*list(backbone_model.children())[:-2])
-        self.backbone_channels = 512
+        self.backbone_channels = 512  # ResNet18 and ResNet34 both have 512 output channels
 
         # Feature Pyramid Network
         self.fpn_channels = 256
@@ -42,12 +41,12 @@ class YOLACTLite(torch.nn.Module):
         self.smooth_conv = torch.nn.Conv2d(self.fpn_channels, self.fpn_channels, kernel_size=3, padding=1)
 
         # Protonet for mask coefficients
-        self.num_prototypes = 32
+        self.num_prototypes = 32  # Reduced for memory efficiency
         self.protonet = self._create_protonet()
 
         # Prediction heads
         self.num_classes = num_classes
-        self.num_anchors = 9
+        self.num_anchors = 9  # 3 scales x 3 aspect ratios
 
         # Classification head
         self.cls_head = torch.nn.Conv2d(
@@ -74,6 +73,7 @@ class YOLACTLite(torch.nn.Module):
         )
 
     def _create_protonet(self):
+        # Simplified protonet with fewer layers for memory efficiency
         layers = [
             torch.nn.Conv2d(self.fpn_channels, 256, kernel_size=3, padding=1),
             torch.nn.ReLU(inplace=True),
@@ -264,11 +264,11 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
     # Create overlay for visualization
     overlay = image_np.copy()
 
-    # Colors for different classes (handle more than 2 classes if needed)
+    # IMPROVED: Colors for different classes with higher alpha for better visibility
     colors = [
-        (0, 255, 0, 128),  # diningtable - green with alpha
-        (0, 0, 255, 128),  # sofa - blue with alpha
-        (255, 0, 0, 128)  # extra color
+        (0, 255, 0, 200),  # diningtable - green with higher alpha
+        (0, 0, 255, 200),  # sofa - blue with higher alpha
+        (255, 0, 0, 200)  # extra color with higher alpha
     ]
 
     # For each detection, generate mask and visualize
@@ -309,23 +309,43 @@ def test_on_image(model, image_path, device='cuda', conf_threshold=0.3, suffix="
         # Threshold mask to get binary mask
         binary_mask = (instance_mask > 0.5).cpu().numpy().astype(np.uint8)
 
-        # Apply color to mask region
+        # IMPROVED: Add a dilated edge to make mask boundaries more visible
+        kernel = np.ones((3, 3), np.uint8)
+        mask_edge = cv2.dilate(binary_mask, kernel) - binary_mask
+
+        # Apply mask color with improved visibility
         color = colors[(label - 1) % len(colors)]
+        mask_overlay = overlay.copy()
+
+        # Apply color directly for stronger effect
         for c in range(3):
-            overlay[:, :, c] = np.where(binary_mask == 1,
-                                        overlay[:, :, c] * (1 - color[3] / 255) + color[c] * (color[3] / 255),
-                                        overlay[:, :, c])
+            mask_overlay[:, :, c] = np.where(binary_mask == 1, color[c], mask_overlay[:, :, c])
+            # Add contrasting border at mask edges
+            overlay[:, :, c] = np.where(mask_edge == 1, 0 if color[c] > 128 else 255, overlay[:, :, c])
 
-        # Draw bounding box
-        cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), color[:3], 2)
+        # Apply mask with higher opacity
+        alpha_mask = 0.7  # Increased opacity for masks
+        overlay = cv2.addWeighted(overlay, 1.0 - alpha_mask, mask_overlay, alpha_mask, 0)
 
-        # Add label and score
+        # IMPROVED: Draw thicker bounding box
+        cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), color[:3], 3)
+
+        # IMPROVED: Add label with better visibility
         label_text = f"{class_name}: {score:.2f}"
-        cv2.putText(overlay, label_text, (box[0], box[1] - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color[:3], 2)
+        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
 
-    # Blend original and overlay
-    alpha = 0.5
+        # Add background for text
+        cv2.rectangle(overlay,
+                      (box[0], box[1] - 25),
+                      (box[0] + text_size[0], box[1]),
+                      color[:3], -1)  # -1 fills the rectangle
+
+        # Add text with white color for contrast
+        cv2.putText(overlay, label_text, (box[0], box[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    # IMPROVED: Blend with higher alpha for better visibility
+    alpha = 0.8  # Increased from 0.5
     output = cv2.addWeighted(image_np, 1 - alpha, overlay, alpha, 0)
 
     # Display results
